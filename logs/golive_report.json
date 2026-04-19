@@ -1,0 +1,26 @@
+{
+  "go_live_date": "2026-04-19T11:09:46.922958+00:00",
+  "system_version": "1.0.0",
+  "pilot_use_case": "Invoice Processing Automation",
+  "services": {
+    "api": "http://127.0.0.1:8000",
+    "dashboard": "http://localhost:8501",
+    "watcher": "watching inbox/"
+  },
+  "test_results": {
+    "week1_accuracy": 100.0,
+    "week2_pipeline_tests": {
+      "All 25 invoices processed": true,
+      "Accuracy > 85% on vendor_name": true,
+      "Accuracy > 85% on invoice_number": true,
+      "Accuracy > 80% on total_amount": true,
+      "Average processing time < 10s": false,
+      "Zero crashes": true,
+      "All rows in Google Sheets / CSV": true
+    },
+    "smoke_test": "PASS"
+  },
+  "output_destination": "Google Sheets / output_fallback.csv",
+  "sample_invoices_processed": 25,
+  "status": "LIVE"
+}

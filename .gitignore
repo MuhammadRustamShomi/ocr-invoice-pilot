@@ -23,6 +23,7 @@ inbox/*
 processed/*
 failed/*
 logs/*
+!logs/golive_report.json
 output_fallback.csv
 
 # Keep folder stubs
