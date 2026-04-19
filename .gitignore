@@ -1,0 +1,44 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Environment & secrets
+.env
+credentials.json
+*.json.key
+
+# OCR model cache
+.EasyOCR/
+
+# Output / working folders
+inbox/*
+processed/*
+failed/*
+logs/*
+output_fallback.csv
+
+# Keep folder stubs
+!inbox/.gitkeep
+!processed/.gitkeep
+!failed/.gitkeep
+!logs/.gitkeep
+
+# Samples (large generated images)
+samples/invoices/*.png
+samples/invoices/*.pdf
+
+# IDE
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+Desktop.ini
