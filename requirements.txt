@@ -1,7 +1,8 @@
 # Streamlit Cloud dashboard dependencies only.
 # For the full local pipeline (OCR, API, watcher), use requirements-dev.txt
 streamlit==1.35.0
-pandas>=2.0.0
+pandas==2.1.4
+numpy==1.26.4
 gspread==6.1.2
 google-auth==2.29.0
 google-auth-oauthlib==1.2.0
