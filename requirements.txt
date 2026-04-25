@@ -1,5 +1,8 @@
 # Streamlit Cloud dashboard dependencies only.
 # For the full local pipeline (OCR, API, watcher), use requirements-dev.txt
+pip>=24.0
+setuptools>=68.0
+wheel
 streamlit==1.35.0
 pandas==2.1.4
 numpy==1.26.4
