@@ -14,6 +14,7 @@ build/
 .env
 credentials.json
 *.json.key
+.streamlit/secrets.toml
 
 # OCR model cache
 .EasyOCR/
