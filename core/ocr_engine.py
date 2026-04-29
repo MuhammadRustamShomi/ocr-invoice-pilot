@@ -99,7 +99,7 @@ class OCREngine:
         h, w = image.shape[:2]
         return cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
 
-    def _resize_for_ocr(self, image: np.ndarray, max_width: int = 745) -> np.ndarray:
+    def _resize_for_ocr(self, image: np.ndarray, max_width: int = 520) -> np.ndarray:
         """Scale down wide images to cap OCR time while preserving readability."""
         h, w = image.shape[:2]
         if w <= max_width:
@@ -113,17 +113,21 @@ class OCREngine:
         if image is None:
             raise FileNotFoundError(f"Could not load image: {image_path}")
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        deskewed = self._deskew(gray)
+        # Resize first so deskew (Canny + HoughLines) runs on a smaller image.
+        resized = self._resize_for_ocr(gray)
+        deskewed = self._deskew(resized)
         contrasted = self._increase_contrast(deskewed)
-        # Resize after full-quality preprocessing so thin text strokes survive.
-        # _denoise is intentionally skipped here — medianBlur destroys sub-pixel
-        # strokes at the scaled-down resolution; noisy images use levels 1–3 fallback.
-        return self._resize_for_ocr(contrasted)
+        return contrasted
 
     def _run_ocr(self, processed_image: np.ndarray):
         if self._backend == "easyocr":
             reader = self._get_reader()
-            results = reader.readtext(processed_image)
+            results = reader.readtext(
+                processed_image,
+                decoder="greedy",
+                batch_size=4,
+                min_size=20,
+            )
             blocks, confidences, lines = [], [], []
             for (bbox, text, conf) in results:
                 blocks.append({"text": text, "confidence": conf * 100, "bbox": bbox})

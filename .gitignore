@@ -37,6 +37,9 @@ output_fallback.csv
 samples/invoices/*.png
 samples/invoices/*.pdf
 
+# Claude Code internal
+.claude/
+
 # IDE
 .vscode/
 .idea/
