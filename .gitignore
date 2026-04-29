@@ -15,6 +15,7 @@ build/
 credentials.json
 *.json.key
 .streamlit/secrets.toml
+streamlit_secrets.toml
 
 # OCR model cache
 .EasyOCR/
