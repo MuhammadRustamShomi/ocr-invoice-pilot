@@ -52,11 +52,6 @@ class SheetsWriter:
             logger.warning(f"credentials.json not found at {creds_path}. Will use CSV fallback.")
 
     def connect(self) -> bool:
-        creds_path = Path(self.credentials_file)
-        if not creds_path.exists():
-            logger.warning("Google credentials not found — using CSV fallback.")
-            self._connected = False
-            return False
         try:
             import gspread
             from google.oauth2.service_account import Credentials
@@ -64,7 +59,19 @@ class SheetsWriter:
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
             ]
-            creds = Credentials.from_service_account_file(str(creds_path), scopes=scopes)
+            # Prefer JSON env var (Railway / cloud deployments) over credentials file
+            creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
+            if creds_json:
+                info = json.loads(creds_json)
+                creds = Credentials.from_service_account_info(info, scopes=scopes)
+                logger.info("Using GOOGLE_CREDENTIALS_JSON env var for Sheets auth.")
+            else:
+                creds_path = Path(self.credentials_file)
+                if not creds_path.exists():
+                    logger.warning("Google credentials not found — using CSV fallback.")
+                    self._connected = False
+                    return False
+                creds = Credentials.from_service_account_file(str(creds_path), scopes=scopes)
             self._client = gspread.authorize(creds)
             self.ensure_sheet_exists()
             self._connected = True

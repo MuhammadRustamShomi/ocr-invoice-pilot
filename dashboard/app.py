@@ -121,21 +121,26 @@ def _compute_stats(df: pd.DataFrame) -> dict:
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Upload Invoice")
-    if not API_URL or "127.0.0.1" in API_URL:
+    _api_is_local = not API_URL or "127.0.0.1" in API_URL or "localhost" in API_URL
+    if _api_is_local:
         st.info(
-            "Upload requires a hosted API.\n\n"
-            "Set `API_URL` in Streamlit secrets to enable this feature, "
-            "or use the local dashboard when running the pipeline locally."
+            "**Upload requires a hosted API.**\n\n"
+            "To enable:\n"
+            "1. Deploy the API to [Railway](https://railway.app) — see `railway.toml` in the repo\n"
+            "2. Or run locally with [ngrok](https://ngrok.com): `ngrok http 8000`\n\n"
+            "Then add to Streamlit secrets:\n"
+            "```\nAPI_URL = \"https://your-api.railway.app\"\n"
+            "API_KEY = \"ocr-pilot-key-2026\"\n```"
         )
     else:
         import requests as _req
         uploaded = st.file_uploader("Choose invoice (PNG, JPG, PDF)",
                                     type=["png", "jpg", "jpeg", "pdf"])
         if uploaded and st.button("Extract Now", type="primary"):
-            with st.spinner("Processing…"):
+            with st.spinner("Processing… (first request may take 30–60 s while the API warms up)"):
                 try:
                     resp = _req.post(
-                        f"{API_URL}/extract",
+                        f"{API_URL.rstrip('/')}/extract",
                         files={"file": (uploaded.name, uploaded.getvalue(), uploaded.type)},
                         headers={"X-API-Key": API_KEY},
                         timeout=120,
@@ -149,12 +154,26 @@ with st.sidebar:
                                  "Date": f.get("invoice_date"),
                                  "Total": f.get("total_amount"),
                                  "Needs Review": d.get("needs_review")})
+                    elif resp.status_code == 401:
+                        st.error("API key rejected (401). Check `API_KEY` in Streamlit secrets.")
+                    elif resp.status_code == 404:
+                        st.error(
+                            f"API endpoint not found (404) at `{API_URL}`.\n\n"
+                            "Make sure the API is deployed and `API_URL` points to the correct host "
+                            "(e.g. `https://your-app.railway.app`, not the Streamlit URL)."
+                        )
                     else:
-                        st.error(f"API error {resp.status_code}: {resp.text[:200]}")
+                        ct = resp.headers.get("content-type", "")
+                        body = resp.json() if "application/json" in ct else resp.text[:300]
+                        st.error(f"API error {resp.status_code}: {body}")
+                except _req.exceptions.ConnectionError:
+                    st.error(f"Cannot reach API at `{API_URL}`. Is it running?")
+                except _req.exceptions.Timeout:
+                    st.error("Request timed out after 120 s. The API may still be processing.")
                 except Exception as exc:
                     st.error(f"Error: {exc}")
     st.divider()
-    st.caption(f"API: {API_URL}")
+    st.caption(f"API: {API_URL or '(not configured)'}")
 
 
 # ── Main content ───────────────────────────────────────────────────────────────

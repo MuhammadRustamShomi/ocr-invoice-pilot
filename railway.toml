@@ -1,0 +1,12 @@
+[build]
+builder = "nixpacks"
+
+[build.nixpacks]
+installCmd = "pip install --upgrade pip setuptools wheel && pip install -r requirements-dev.txt && python -c \"import easyocr; easyocr.Reader(['en'], gpu=False, verbose=False)\" || true"
+
+[deploy]
+startCommand = "uvicorn api.main:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
