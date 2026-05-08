@@ -213,22 +213,74 @@ def _ocr_with_vision(image_bytes: bytes, creds_info: dict) -> dict:
         return {"raw_text": "", "confidence": 0.0, "error": str(exc)}
 
 
-def _pdf_to_png_pages(pdf_bytes: bytes) -> list[bytes]:
-    """Convert each PDF page to a PNG bytes object using PyMuPDF."""
+def _ocr_pdf_with_vision(pdf_bytes: bytes, creds_info: dict) -> dict:
+    """
+    OCR a PDF directly using Vision API files:annotate (up to 5 pages sync).
+    No PDF-to-image conversion required — Vision API handles PDFs natively.
+    Returns {"raw_text": str, "confidence": float, "error": str | None}
+    """
     try:
-        import fitz
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        pages = []
-        for page in doc:
-            mat = fitz.Matrix(2.0, 2.0)  # 2× zoom → better OCR quality
-            pix = page.get_pixmap(matrix=mat)
-            pages.append(pix.tobytes("png"))
-        doc.close()
-        return pages
-    except ImportError:
-        return []
-    except Exception:
-        return []
+        import base64
+        import requests as _req
+        from google.oauth2.service_account import Credentials
+        from google.auth.transport.requests import Request as _GRequest
+
+        creds = Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        creds.refresh(_GRequest())
+
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        resp = _req.post(
+            "https://vision.googleapis.com/v1/files:annotate",
+            headers={
+                "Authorization": f"Bearer {creds.token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "requests": [{
+                    "inputConfig": {
+                        "content": pdf_b64,
+                        "mimeType": "application/pdf",
+                    },
+                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+                    "pages": [1, 2, 3, 4, 5],  # up to 5 pages per sync request
+                }]
+            },
+            timeout=60,
+        )
+
+        if resp.status_code != 200:
+            return {"raw_text": "", "confidence": 0.0,
+                    "error": f"Vision API HTTP {resp.status_code}: {resp.text[:300]}"}
+
+        data = resp.json()
+        file_resp = (data.get("responses") or [{}])[0]
+
+        if "error" in file_resp:
+            return {"raw_text": "", "confidence": 0.0,
+                    "error": file_resp["error"].get("message", "Vision API error")}
+
+        # files:annotate returns one response per page inside file_resp["responses"]
+        page_responses = file_resp.get("responses", [])
+        texts, confs = [], []
+        for pr in page_responses:
+            annotation = pr.get("fullTextAnnotation", {})
+            if annotation.get("text"):
+                texts.append(annotation["text"])
+            for page in annotation.get("pages", []):
+                for block in page.get("blocks", []):
+                    c = block.get("confidence", 0)
+                    if c > 0:
+                        confs.append(c * 100)
+
+        full_text = "\n".join(texts)
+        confidence = sum(confs) / len(confs) if confs else 85.0
+        return {"raw_text": full_text, "confidence": round(confidence, 1), "error": None}
+
+    except Exception as exc:
+        return {"raw_text": "", "confidence": 0.0, "error": str(exc)}
 
 
 def process_file(file_bytes: bytes, filename: str, creds_info: dict) -> dict:
@@ -242,31 +294,16 @@ def process_file(file_bytes: bytes, filename: str, creds_info: dict) -> dict:
 
     # ── Step 1: OCR ────────────────────────────────────────────────────────────
     if is_pdf:
-        pages = _pdf_to_png_pages(file_bytes)
-        if not pages:
+        r = _ocr_pdf_with_vision(file_bytes, creds_info)
+        raw_text = r["raw_text"]
+        ocr_confidence = r["confidence"]
+        if r["error"] and not raw_text:
             return {
                 "status": "failed", "filename": filename,
-                "error": "Could not convert PDF to images. Ensure PyMuPDF is installed.",
+                "error": r["error"],
                 "fields": {}, "confidence": 0.0, "needs_review": True,
                 "processing_time_seconds": round(time.time() - start, 2),
             }
-        texts, confidences, last_error = [], [], None
-        for page_bytes in pages:
-            r = _ocr_with_vision(page_bytes, creds_info)
-            if r["raw_text"]:
-                texts.append(r["raw_text"])
-                confidences.append(r["confidence"])
-            if r["error"]:
-                last_error = r["error"]
-        if not texts:
-            return {
-                "status": "failed", "filename": filename,
-                "error": last_error or "OCR returned no text from PDF",
-                "fields": {}, "confidence": 0.0, "needs_review": True,
-                "processing_time_seconds": round(time.time() - start, 2),
-            }
-        raw_text = "\n".join(texts)
-        ocr_confidence = sum(confidences) / len(confidences)
     else:
         r = _ocr_with_vision(file_bytes, creds_info)
         raw_text = r["raw_text"]
