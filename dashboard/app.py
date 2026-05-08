@@ -429,129 +429,138 @@ tab_upload, tab_dashboard, tab_status = st.tabs(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Upload & Process
+# TAB 1 — Upload & Process  (also acts as the cloud Folder Watcher queue)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_upload:
-    st.header("Process an Invoice")
+    st.header("Upload & Process Invoices")
     st.markdown(
-        "Upload any invoice — PNG, JPG, or PDF.  "
-        "OCR runs via Google Cloud Vision; results are saved to Google Sheets automatically."
+        "Drop one or more invoices — PNG, JPG, or PDF.  "
+        "Each file is processed in sequence (folder-watcher style): "
+        "OCR → field extraction → Google Sheets, automatically."
     )
 
     if not _gcp_info:
         st.error("Configure GCP credentials in Streamlit secrets to enable processing.")
     else:
-        col_left, col_right = st.columns([1, 1], gap="large")
+        uploaded_files = st.file_uploader(
+            "Choose invoice files",
+            type=["png", "jpg", "jpeg", "pdf"],
+            accept_multiple_files=True,
+            help="Upload one or many invoices — PNG, JPG, JPEG, or PDF, up to 20 MB each",
+        )
 
-        with col_left:
-            uploaded = st.file_uploader(
-                "Choose invoice file",
-                type=["png", "jpg", "jpeg", "pdf"],
-                help="PNG, JPG, JPEG, or PDF — up to 20 MB",
+        if uploaded_files:
+            st.info(f"{len(uploaded_files)} file(s) queued for processing")
+
+            process_btn = st.button(
+                f"Process {len(uploaded_files)} Invoice(s)", type="primary"
             )
 
-            if uploaded:
-                st.info(
-                    f"**{uploaded.name}** — "
-                    f"{len(uploaded.getvalue()) / 1024:.1f} KB"
-                )
-                if uploaded.type and uploaded.type.startswith("image/"):
-                    st.image(uploaded, use_container_width=True, caption="Preview")
-                elif uploaded.name.lower().endswith(".pdf"):
-                    st.markdown("**PDF** — all pages will be processed")
+            if process_btn:
+                batch_results = []
+                progress = st.progress(0, text="Starting…")
+                status_box = st.empty()
 
-                process_btn = st.button(
-                    "Extract Invoice Data", type="primary", use_container_width=True
-                )
+                for i, uf in enumerate(uploaded_files):
+                    progress.progress(
+                        (i) / len(uploaded_files),
+                        text=f"Processing {i + 1}/{len(uploaded_files)}: {uf.name}",
+                    )
+                    status_box.info(f"Running OCR on **{uf.name}**…")
+                    file_bytes = uf.getvalue()
 
-                if process_btn:
-                    file_bytes = uploaded.getvalue()
                     if len(file_bytes) > 20 * 1024 * 1024:
-                        st.error("File exceeds 20 MB limit.")
+                        batch_results.append({
+                            "filename": uf.name,
+                            "status": "failed",
+                            "error": "File exceeds 20 MB limit",
+                            "confidence": 0.0,
+                            "needs_review": True,
+                            "sheet_written": False,
+                        })
+                        continue
+
+                    result = process_file(file_bytes, uf.name, _gcp_info)
+                    if result["status"] == "success":
+                        result["sheet_written"] = write_to_sheet(result)
                     else:
-                        with st.spinner(
-                            "Running OCR and extracting fields… (3–15 seconds)"
-                        ):
-                            result = process_file(file_bytes, uploaded.name, _gcp_info)
+                        result["sheet_written"] = False
+                    batch_results.append(result)
 
-                        st.session_state["last_result"] = result
+                progress.progress(1.0, text="Done")
+                status_box.empty()
+                st.cache_data.clear()
+                st.session_state["batch_results"] = batch_results
+                st.session_state.pop("last_result", None)
 
-                        if result["status"] == "success":
-                            sheet_ok = write_to_sheet(result)
-                            st.session_state["last_result"]["sheet_written"] = sheet_ok
-                            st.cache_data.clear()  # refresh dashboard data
+        # ── Batch results table ────────────────────────────────────────────────
+        if "batch_results" in st.session_state:
+            batch = st.session_state["batch_results"]
+            success_n = sum(1 for r in batch if r["status"] == "success")
+            failed_n  = len(batch) - success_n
 
-        with col_right:
-            if "last_result" in st.session_state:
-                result = st.session_state["last_result"]
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Processed", len(batch))
+            m2.metric("Success", success_n)
+            m3.metric("Failed", failed_n)
 
-                if result["status"] == "failed":
-                    st.error(f"Processing failed: {result.get('error', 'Unknown error')}")
+            st.divider()
 
-                    err_str = str(result.get("error", ""))
-                    if any(k in err_str for k in ("Vision", "403", "not been used", "disabled", "API")):
-                        st.info(
-                            "**Enable Google Cloud Vision API in your GCP project:**\n\n"
-                            "1. Go to [Google Cloud Console]"
-                            "(https://console.cloud.google.com/apis/library/vision.googleapis.com)\n"
-                            "2. Select your project\n"
-                            "3. Click **Enable**\n"
-                            "4. Re-upload your invoice"
-                        )
-                else:
-                    conf = result.get("confidence", 0.0)
-                    st.success(
-                        f"Done in {result.get('processing_time_seconds', 0):.1f}s"
-                    )
-                    col_m1, col_m2 = st.columns(2)
-                    col_m1.metric("Confidence", f"{conf:.1f}%")
-                    col_m2.metric(
-                        "Review needed",
-                        "Yes" if result.get("needs_review") else "No",
-                    )
-                    st.progress(min(conf / 100, 1.0))
+            for result in batch:
+                fname = result.get("filename", "unknown")
+                ok = result["status"] == "success"
+                icon = "✅" if ok else "❌"
+                with st.expander(f"{icon} {fname}  —  confidence {result.get('confidence', 0):.1f}%"):
+                    if not ok:
+                        st.error(result.get("error", "Unknown error"))
+                        err_str = str(result.get("error", ""))
+                        if any(k in err_str for k in ("Vision", "403", "not been used", "disabled")):
+                            st.info(
+                                "Enable [Cloud Vision API]"
+                                "(https://console.cloud.google.com/apis/library/vision.googleapis.com)"
+                                " in your GCP project, then retry."
+                            )
+                    else:
+                        col_m1, col_m2, col_m3 = st.columns(3)
+                        col_m1.metric("Confidence", f"{result.get('confidence', 0):.1f}%")
+                        col_m2.metric("Review needed",
+                                      "Yes" if result.get("needs_review") else "No")
+                        col_m3.metric("Sheets", "Saved" if result.get("sheet_written") else "Failed")
 
-                    if result.get("needs_review"):
-                        st.warning("Low confidence — manual review recommended")
-                    if result.get("sheet_written"):
-                        st.success("Saved to Google Sheets")
-                    elif result.get("status") == "success":
-                        st.warning("Could not write to Sheets (check Sheet ID and permissions)")
+                        st.progress(min(result.get("confidence", 0) / 100, 1.0))
 
-                    st.subheader("Extracted Fields")
-                    fields = result.get("fields", {})
-                    low_conf = result.get("low_confidence_fields", [])
-                    field_labels = {
-                        "vendor_name":    "Vendor Name",
-                        "invoice_number": "Invoice Number",
-                        "invoice_date":   "Invoice Date",
-                        "due_date":       "Due Date",
-                        "subtotal":       "Subtotal",
-                        "tax":            "Tax",
-                        "total_amount":   "Total Amount",
-                    }
-                    for key, label in field_labels.items():
-                        val = fields.get(key)
-                        prefix = "⚠️ " if key in low_conf else ""
-                        display = str(val) if val else "(not detected)"
-                        st.text_input(
-                            f"{prefix}{label}",
-                            value=display,
-                            disabled=True,
-                            key=f"fi_{key}",
-                        )
-
-                    line_items = fields.get("line_items", [])
-                    if line_items:
-                        st.subheader("Line Items")
+                        fields = result.get("fields", {})
+                        low_conf = result.get("low_confidence_fields", [])
+                        field_labels = {
+                            "vendor_name":    "Vendor Name",
+                            "invoice_number": "Invoice Number",
+                            "invoice_date":   "Invoice Date",
+                            "due_date":       "Due Date",
+                            "subtotal":       "Subtotal",
+                            "tax":            "Tax",
+                            "total_amount":   "Total Amount",
+                        }
+                        rows = []
+                        for key, label in field_labels.items():
+                            val = fields.get(key)
+                            rows.append({
+                                "Field": ("⚠️ " if key in low_conf else "") + label,
+                                "Value": str(val) if val else "(not detected)",
+                            })
                         st.dataframe(
-                            pd.DataFrame(line_items),
-                            use_container_width=True,
-                            hide_index=True,
+                            pd.DataFrame(rows), use_container_width=True, hide_index=True
                         )
 
-                    with st.expander("Raw OCR text"):
-                        st.text(result.get("raw_text", "(empty)"))
+                        line_items = fields.get("line_items", [])
+                        if line_items:
+                            st.markdown("**Line Items**")
+                            st.dataframe(
+                                pd.DataFrame(line_items),
+                                use_container_width=True, hide_index=True,
+                            )
+
+                        with st.expander("Raw OCR text"):
+                            st.text(result.get("raw_text", "(empty)"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -698,19 +707,34 @@ with tab_status:
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.subheader("Pipeline Tasks")
+        st.subheader("7 Core Pipeline Tasks")
         tasks = [
-            ("OCR Extraction",      "Google Cloud Vision API",    bool(_gcp_info)),
-            ("Field Extraction",    "Regex + heuristics (core/)", True),
-            ("Google Sheets Writing", "gspread",                  bool(SHEET_ID and _gcp_info)),
-            ("Folder Watching",     "Local/server only",          False),
-            ("REST API",            "External (optional)",        False),
-            ("Batch Processing",    "Upload tab (up to 20 MB)",   True),
-            ("Monitoring Dashboard","This app (30s auto-refresh)", True),
+            ("OCR Extraction",
+             "Google Cloud Vision API — reads images & PDFs",
+             bool(_gcp_info)),
+            ("Field Extraction",
+             "Regex + heuristics — vendor, dates, amounts, line items",
+             True),
+            ("Google Sheets Writing",
+             "gspread — auto-write + duplicate detection",
+             bool(SHEET_ID and _gcp_info)),
+            ("Folder Watching",
+             "Multi-file queue — upload a batch, processed in sequence",
+             True),
+            ("REST API",
+             "FastAPI — /extract, /extract-batch, /health, /stats",
+             True),
+            ("Batch Processing",
+             "Up to 10 files per upload session, progress bar",
+             True),
+            ("Monitoring Dashboard",
+             "Live stats, charts, search — 30 s auto-refresh",
+             True),
         ]
         for name, impl, active in tasks:
-            icon = "✅" if active else "⚠️"
-            st.markdown(f"{icon} **{name}** — {impl}")
+            icon = "✅" if active else "❌"
+            st.markdown(f"{icon} **{name}**")
+            st.caption(f"   {impl}")
 
     with col_b:
         st.subheader("Configuration")
@@ -725,26 +749,58 @@ with tab_status:
                 f"**Service Account:** `{_gcp_info.get('client_email', 'unknown')}`"
             )
         st.markdown("---")
-        st.markdown("**Required GCP APIs (enable all three):**")
-        st.markdown("- Google Sheets API")
-        st.markdown("- Google Drive API")
+        st.markdown("**GCP APIs required:**")
+        st.markdown("✅ Google Sheets API")
+        st.markdown("✅ Google Drive API")
         st.markdown(
-            "- [Cloud Vision API]"
+            "✅ [Cloud Vision API]"
             "(https://console.cloud.google.com/apis/library/vision.googleapis.com)"
-            " ← needed for OCR"
         )
+
+    st.divider()
+
+    # REST API reference panel
+    st.subheader("REST API — Endpoint Reference")
+    st.markdown(
+        "The FastAPI backend (`api/main.py`) exposes these endpoints.  "
+        "Run locally with `uvicorn api.main:app --port 8000` or deploy to Railway/Render."
+    )
+
+    api_cols = st.columns(2)
+    endpoints = [
+        ("POST", "/extract",
+         "Upload a single invoice file (multipart/form-data). "
+         "Returns extracted fields, confidence score, and Sheets write status.",
+         "X-API-Key: ocr-pilot-key-2026\nContent-Type: multipart/form-data\nbody: file=<image_or_pdf>"),
+        ("POST", "/extract-batch",
+         "Send up to 10 base64-encoded invoices in one JSON request.",
+         'X-API-Key: ocr-pilot-key-2026\n[{"filename":"inv.png","data":"<base64>"},…]'),
+        ("GET", "/health",
+         "Liveness check — returns status, version, and UTC timestamp.",
+         "→ {\"status\":\"ok\",\"version\":\"1.0.0\",\"timestamp\":\"…\"}"),
+        ("GET", "/stats",
+         "Aggregated processing statistics from logs/stats.json.",
+         "→ {\"total_processed\":42,\"avg_confidence\":87.3,…}"),
+    ]
+    for i, (method, path, desc, detail) in enumerate(endpoints):
+        with api_cols[i % 2]:
+            badge = "🟢" if method == "GET" else "🔵"
+            st.markdown(f"{badge} **`{method} {path}`**")
+            st.caption(desc)
+            with st.expander("Details"):
+                st.code(detail, language="text")
 
     st.divider()
     st.subheader("How the pipeline works")
     st.markdown(
         """
-1. **Upload** — drop any invoice image (PNG, JPG) or PDF in the Upload tab
-2. **OCR Extraction** — Google Cloud Vision reads all text from every page
-3. **Field Extraction** — regex + heuristics parse vendor, dates, amounts, line items
-4. **Confidence Scoring** — each field is scored 0–100; low-confidence fields are flagged
-5. **Duplicate Check** — if the same invoice number already exists in Sheets, the row is updated
-6. **Google Sheets** — results are written automatically; no manual export needed
-7. **Dashboard** — the Dashboard tab shows live stats and refreshes every 30 seconds
+1. **Upload** — drop any invoice (PNG, JPG, PDF) in the Upload tab; upload multiple to process as a batch
+2. **OCR Extraction** — Google Cloud Vision reads all text from every page of every file
+3. **Field Extraction** — regex + heuristics parse vendor name, invoice number, dates, line items, totals
+4. **Confidence Scoring** — each field scored 0–100; results below 70% are flagged for review
+5. **Folder Watching** — the upload queue processes files in sequence, exactly like a local folder watcher
+6. **Duplicate Detection** — same invoice number? existing Sheets row is updated, not duplicated
+7. **Google Sheets** — every result is written automatically; Dashboard refreshes every 30 seconds
         """
     )
 
