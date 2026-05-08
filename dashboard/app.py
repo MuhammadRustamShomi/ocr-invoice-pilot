@@ -7,8 +7,17 @@ All 7 pipeline tasks run inside this app — no external API required.
 import io
 import json
 import os
+import re
+import sys
 import time
 from datetime import datetime, timezone
+
+# Streamlit Cloud runs `streamlit run dashboard/app.py`, which adds dashboard/
+# to sys.path — so `from core.xxx import ...` fails unless we add the project
+# root (one directory up) explicitly.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import pandas as pd
 import streamlit as st
@@ -329,20 +338,21 @@ def process_file(file_bytes: bytes, filename: str, creds_info: dict) -> dict:
             }
 
     # ── Step 2: Field extraction + confidence scoring ──────────────────────────
+    _core_import_err: str = ""
     try:
         from core.field_extractor import FieldExtractor
         from core.confidence_scorer import ConfidenceScorer
         extractor = FieldExtractor()
         scorer = ConfidenceScorer()
-    except Exception:
-        # Inline minimal fallback so the app never hard-crashes
+    except Exception as _exc:
+        _core_import_err = str(_exc)
         extractor = _MinimalExtractor()
         scorer = _MinimalScorer()
 
     fields = extractor.extract_all(raw_text)
     scoring = scorer.score_extraction(fields, ocr_confidence)
 
-    return {
+    result: dict = {
         "status": "success",
         "filename": filename,
         "fields": fields,
@@ -351,46 +361,182 @@ def process_file(file_bytes: bytes, filename: str, creds_info: dict) -> dict:
         "processing_time_seconds": round(time.time() - start, 2),
         "needs_review": scoring["needs_review"],
         "raw_text": raw_text,
+        "extractor": "FieldExtractor" if not _core_import_err else f"Fallback ({_core_import_err})",
     }
+    return result
 
 
 # ── Minimal inline fallbacks (used only if core/ imports fail) ─────────────────
 class _MinimalExtractor:
-    """Bare-minimum field extractor used if core/field_extractor.py is unavailable."""
+    """
+    Full-featured fallback extractor embedded in app.py so the app works even
+    if sys.path doesn't contain the project root at import time.
+    Handles same-line, next-line, AND two-column (Vision API column-by-column) layouts.
+    """
+
+    _AMT_RE = re.compile(
+        r"[\$£€]?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)"
+    )
+    _DATE_RE = re.compile(
+        r"\b(\d{4}[/\-]\d{1,2}[/\-]\d{1,2}"
+        r"|\d{1,2}[/\-]\d{1,2}[/\-]\d{4}"
+        r"|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}"
+        r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})\b",
+        re.I,
+    )
+
+    def _amt(self, text: str):
+        m = self._AMT_RE.search(text)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                if val >= 1.0:
+                    return f"${m.group(1)}"
+            except ValueError:
+                pass
+        return None
+
+    def _date_after(self, label_pat: str, text: str):
+        """Extract a date from same line or next line after a label pattern.
+        Wraps label_pat in (?:...) so alternation | doesn't swallow the suffix.
+        """
+        lp = f"(?:{label_pat})"
+        # Same line
+        m = re.search(lp + r"([^\n]{0,60})", text, re.I)
+        if m:
+            d = self._DATE_RE.search(m.group(1) or "")
+            if d:
+                return d.group(0)
+        # Next line
+        m = re.search(lp + r"[^\n]{0,10}\n\s*([^\n]{0,60})", text, re.I)
+        if m:
+            d = self._DATE_RE.search(m.group(1) or "")
+            if d:
+                return d.group(0)
+        return None
+
+    def _amt_after(self, label_pat: str, text: str):
+        """Extract an amount from same line or next line after a label pattern.
+        Wraps label_pat in (?:...) so alternation | doesn't swallow the suffix.
+        """
+        lp = f"(?:{label_pat})"
+        m = re.search(lp + r"([^\n]{0,60})", text, re.I)
+        if m and self._amt(m.group(1) or ""):
+            return self._amt(m.group(1))
+        m = re.search(lp + r"[^\n]{0,10}\n\s*([^\n]{0,60})", text, re.I)
+        if m and self._amt(m.group(1) or ""):
+            return self._amt(m.group(1))
+        return None
+
+    def _two_column_block(self, text: str) -> dict:
+        """
+        Detect Vision-API two-column reads: all labels first, then all amounts.
+        E.g.: Subtotal:\nTax (15%):\nGrand Total:\n$2,220\n$333\n$2,553
+        """
+        _LABEL_FIELD = [
+            ("subtotal",     [r"sub\s*total", r"subtotal", r"net\s*amount"]),
+            ("tax",          [r"tax(?:\s*\(\d+%\))?", r"vat\b", r"gst\b"]),
+            ("total_amount", [r"grand\s*total", r"total\s*due", r"amount\s*due",
+                              r"total\s*amount", r"balance\s*due", r"(?<![a-z])total(?![a-z])"]),
+        ]
+        result: dict = {}
+        lines = [ln.strip() for ln in text.split("\n")]
+        for start in range(len(lines)):
+            labels_run, i = [], start
+            while i < len(lines):
+                ln = lines[i]
+                if not ln:
+                    i += 1; continue
+                hit = None
+                for field, pats in _LABEL_FIELD:
+                    if any(re.search(p, ln, re.I) for p in pats):
+                        if not re.search(r"[\$£€]\s*\d|\d{3,}", ln):
+                            hit = field; break
+                if hit:
+                    labels_run.append(hit); i += 1
+                else:
+                    break
+            if len(labels_run) < 2:
+                continue
+            amts_run, j = [], i
+            while j < len(lines) and len(amts_run) < len(labels_run):
+                ln = lines[j]
+                if not ln:
+                    j += 1; continue
+                a = self._amt(ln)
+                if a:
+                    amts_run.append(a); j += 1
+                else:
+                    break
+            if len(amts_run) == len(labels_run):
+                for field, amt in zip(labels_run, amts_run):
+                    result[field] = amt
+                if len(result) >= 2:
+                    break
+        return result
 
     def extract_all(self, text: str) -> dict:
-        import re
         fields: dict = {
             "vendor_name": None, "invoice_number": None,
             "invoice_date": None, "due_date": None,
             "line_items": [], "subtotal": None, "tax": None, "total_amount": None,
         }
-        # Invoice number
-        m = re.search(r"(INV[-\s]?\d[\w\-]+|Invoice\s*#\s*[\w\-]+)", text, re.I)
+
+        # Invoice number — direct INV-XXXX pattern first, then label-based
+        m = re.search(r"\bINV[-\s/]?\d{4}[-\s/]?\d{2,6}\b", text, re.I)
         if m:
             fields["invoice_number"] = m.group(0).strip()
-        # Total
-        m = re.search(r"(?:Grand\s*Total|Total\s*Due|Total)[:\s]+[\$£€]?\s*([\d,]+\.?\d*)", text, re.I)
-        if m:
-            fields["total_amount"] = f"${m.group(1)}"
-        # Date
-        m = re.search(r"\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{4}|\d{4}[/\-]\d{2}[/\-]\d{2})\b", text)
-        if m:
-            fields["invoice_date"] = m.group(0)
-        # Vendor: first non-blank, non-numeric line
+        else:
+            m = re.search(
+                r"Invoice\s*(?:#|No\.?|Number|ID)[:\.\s\n]+([\w][\w\-/]{2,})",
+                text, re.I,
+            )
+            if m:
+                fields["invoice_number"] = m.group(1).strip()
+
+        # Dates
+        fields["invoice_date"] = self._date_after(
+            r"Invoice\s*Date[:\s]*|Date\s*Issued[:\s]*|Date[:\s]*", text)
+        fields["due_date"] = self._date_after(
+            r"(?:Payment\s*)?Due\s*Date[:\s]*|Due\s*By[:\s]*", text)
+
+        # Financial amounts — same-line / next-line
+        fields["subtotal"]     = self._amt_after(r"Sub\s*Total[:\s]*|Subtotal[:\s]*|Net\s*Amount[:\s]*", text)
+        fields["tax"]          = self._amt_after(r"Tax(?:\s*\(\d+%\))?[:\s]*|VAT[:\s]*|GST[:\s]*", text)
+        fields["total_amount"] = (
+            self._amt_after(r"Grand\s*Total[:\s]*", text)
+            or self._amt_after(r"Total\s*Due[:\s]*|Amount\s*Due[:\s]*", text)
+            or self._amt_after(r"(?<!\w)Total[:\s]*", text)
+        )
+
+        # Two-column fallback for any still-missing financial fields
+        block = self._two_column_block(text)
+        if len(block) == 3:
+            fields.update(block)
+        else:
+            for f in ("subtotal", "tax", "total_amount"):
+                if not fields[f] and block.get(f):
+                    fields[f] = block[f]
+
+        # Vendor: first substantive non-numeric line
         for line in text.split("\n"):
             line = line.strip()
             if line and len(line) > 3 and not re.match(r"^[\d\W]+$", line):
                 fields["vendor_name"] = line
                 break
+
         return fields
 
 
 class _MinimalScorer:
     def score_extraction(self, fields: dict, ocr_confidence: float) -> dict:
-        present = sum(1 for v in fields.values() if v and v != [])
-        overall = round((present / max(len(fields), 1)) * 60 + ocr_confidence * 0.4, 1)
-        low = [k for k, v in fields.items() if not v or v == []]
+        # line_items=[] is acceptable; don't penalise it
+        key_fields = {k: v for k, v in fields.items() if k != "line_items"}
+        present = sum(1 for v in key_fields.values() if v)
+        total   = len(key_fields)
+        field_pct = present / max(total, 1)
+        overall = round(field_pct * 60 + ocr_confidence * 0.4, 1)
+        low = [k for k, v in key_fields.items() if not v]
         return {
             "overall": overall,
             "field_scores": {},
@@ -539,6 +685,9 @@ with tab_upload:
                                       "Yes" if result.get("needs_review") else "No")
                         col_m3.metric("Sheets", "Saved" if result.get("sheet_written") else "Failed")
 
+                        eng = result.get("extractor", "")
+                        if eng and "Fallback" in eng:
+                            st.warning(f"Core extractor unavailable — using fallback. Reason: {eng}")
                         st.progress(min(result.get("confidence", 0) / 100, 1.0))
 
                         fields = result.get("fields", {})
