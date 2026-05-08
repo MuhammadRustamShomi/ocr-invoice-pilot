@@ -151,46 +151,64 @@ def write_to_sheet(result: dict) -> bool:
         return False
 
 
-# ── OCR via Google Cloud Vision API ───────────────────────────────────────────
+# ── OCR via Google Cloud Vision REST API ──────────────────────────────────────
 def _ocr_with_vision(image_bytes: bytes, creds_info: dict) -> dict:
     """
-    OCR a single image using Google Cloud Vision document_text_detection.
+    OCR a single image using the Vision API REST endpoint directly.
+    Uses only requests + google-auth (no google-cloud-vision package needed).
     Returns {"raw_text": str, "confidence": float, "error": str | None}
     """
     try:
-        from google.cloud import vision as gv
+        import base64
+        import requests as _req
         from google.oauth2.service_account import Credentials
+        from google.auth.transport.requests import Request as _GRequest
 
         creds = Credentials.from_service_account_info(
             creds_info,
             scopes=["https://www.googleapis.com/auth/cloud-platform"],
         )
-        client = gv.ImageAnnotatorClient(credentials=creds)
-        image = gv.Image(content=image_bytes)
-        response = client.document_text_detection(image=image)
+        creds.refresh(_GRequest())
 
-        if response.error.message:
-            return {"raw_text": "", "confidence": 0.0, "error": response.error.message}
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        resp = _req.post(
+            "https://vision.googleapis.com/v1/images:annotate",
+            headers={
+                "Authorization": f"Bearer {creds.token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "requests": [{
+                    "image": {"content": image_b64},
+                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+                }]
+            },
+            timeout=45,
+        )
 
-        full_text = ""
-        confidence = 85.0  # default when Vision API doesn't return per-block confidence
+        if resp.status_code != 200:
+            return {"raw_text": "", "confidence": 0.0,
+                    "error": f"Vision API HTTP {resp.status_code}: {resp.text[:300]}"}
 
-        if response.full_text_annotation:
-            full_text = response.full_text_annotation.text
-            confs = [
-                block.confidence * 100
-                for page in response.full_text_annotation.pages
-                for block in page.blocks
-                if block.confidence > 0
-            ]
-            if confs:
-                confidence = sum(confs) / len(confs)
+        data = resp.json()
+        r = (data.get("responses") or [{}])[0]
+
+        if "error" in r:
+            return {"raw_text": "", "confidence": 0.0,
+                    "error": r["error"].get("message", "Vision API error")}
+
+        full_text = r.get("fullTextAnnotation", {}).get("text", "")
+        pages = r.get("fullTextAnnotation", {}).get("pages", [])
+        confs = [
+            block.get("confidence", 0) * 100
+            for page in pages
+            for block in page.get("blocks", [])
+            if block.get("confidence", 0) > 0
+        ]
+        confidence = sum(confs) / len(confs) if confs else 85.0
 
         return {"raw_text": full_text, "confidence": round(confidence, 1), "error": None}
 
-    except ImportError:
-        return {"raw_text": "", "confidence": 0.0,
-                "error": "google-cloud-vision package not installed"}
     except Exception as exc:
         return {"raw_text": "", "confidence": 0.0, "error": str(exc)}
 
