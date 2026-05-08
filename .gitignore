@@ -45,6 +45,10 @@ samples/invoices/*.pdf
 .vscode/
 .idea/
 
+# Previous deployment configs (replaced by Cloud Run)
+railway.toml
+render.yaml
+
 # Windows
 Thumbs.db
 Desktop.ini
