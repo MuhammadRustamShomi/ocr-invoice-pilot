@@ -43,7 +43,7 @@ class FieldExtractor:
     }
 
     def extract_all(self, raw_text: str) -> dict:
-        return {
+        result = {
             "vendor_name":    self.extract_vendor_name(raw_text),
             "invoice_number": self.extract_invoice_number(raw_text),
             "invoice_date":   self.extract_date(raw_text),
@@ -53,6 +53,25 @@ class FieldExtractor:
             "tax":            self.extract_tax(raw_text),
             "total_amount":   self.extract_total(raw_text),
         }
+
+        # Vision API often reads two-column financial summaries column-by-column:
+        #   Subtotal:          becomes  Subtotal:\n
+        #   Tax (15%):                  Tax (15%):\n
+        #   Grand Total:                Grand Total:\n
+        #                               $2,220.00\n  ← actually Subtotal
+        #                               $333.00\n    ← actually Tax
+        #                               $2,553.00    ← actually Grand Total
+        # The block extractor detects this pattern and maps by position.
+        block = self._extract_financial_block(raw_text)
+        if len(block) == 3:
+            # Full block found — override individual results (positional mapping is reliable)
+            result.update(block)
+        else:
+            for field in ("subtotal", "tax", "total_amount"):
+                if not result[field] and block.get(field):
+                    result[field] = block[field]
+
+        return result
 
     def extract_vendor_name(self, raw_text: str) -> Optional[str]:
         company_indicators = ["ltd", "llc", "inc", "corp", "co.", "limited",
@@ -296,6 +315,76 @@ class FieldExtractor:
             except ValueError:
                 pass
         return None
+
+
+    # ── label-to-field mapping used by _extract_financial_block ─────────────
+    _FIN_LABELS = [
+        ("subtotal",     [r"sub\s*total", r"subtotal", r"net\s*amount"]),
+        ("tax",          [r"tax(?:\s*\(\d+%\))?", r"vat(?:\b)", r"gst(?:\b)"]),
+        ("total_amount", [
+            r"grand\s*total", r"total\s*due", r"amount\s*due",
+            r"total\s*amount", r"balance\s*due", r"(?<![a-z])total(?![a-z])",
+        ]),
+    ]
+
+    def _extract_financial_block(self, raw_text: str) -> dict:
+        """
+        Detect Vision-API two-column reads where all labels appear before all values.
+        Scans for a run of label-only lines immediately followed by a run of
+        amount-only lines; maps them 1:1 by position.
+        Returns a dict with up to three keys: subtotal, tax, total_amount.
+        """
+        result: dict = {}
+        lines = [ln.strip() for ln in raw_text.split("\n")]
+
+        for start in range(len(lines)):
+            labels_run: list = []
+            i = start
+
+            # Collect consecutive label-only lines (line identifies a field, no amount embedded)
+            while i < len(lines):
+                ln = lines[i]
+                if not ln:
+                    i += 1
+                    continue
+                matched_field = None
+                for field, patterns in self._FIN_LABELS:
+                    if any(re.search(p, ln, re.IGNORECASE) for p in patterns):
+                        # Reject if the line itself already contains a currency amount
+                        if not re.search(r"[\$£€]\s*\d|\d{3,}", ln):
+                            matched_field = field
+                            break
+                if matched_field:
+                    labels_run.append(matched_field)
+                    i += 1
+                else:
+                    break
+
+            if len(labels_run) < 2:
+                continue
+
+            # Collect amount lines immediately following the label run
+            amounts_run: list = []
+            j = i
+            while j < len(lines) and len(amounts_run) < len(labels_run):
+                ln = lines[j]
+                if not ln:
+                    j += 1
+                    continue
+                amt = self._extract_currency_amount(ln)
+                if amt:
+                    amounts_run.append(amt)
+                    j += 1
+                else:
+                    break
+
+            if len(amounts_run) == len(labels_run):
+                for field, amt in zip(labels_run, amounts_run):
+                    result[field] = amt
+                if len(result) >= 2:
+                    break  # Good enough match found
+
+        return result
 
 
 if __name__ == "__main__":
