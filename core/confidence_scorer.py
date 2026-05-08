@@ -39,8 +39,12 @@ class ConfidenceScorer:
             avg_field = 0.0
         overall = (avg_field * 0.6 + ocr_confidence * 0.4)
 
-        low_confidence_fields = [f for f, s in field_scores.items() if s < THRESHOLD]
-        needs_review = overall < THRESHOLD or len(low_confidence_fields) >= 2
+        # Exclude line_items from the low-confidence check — it's rarely extracted
+        low_confidence_fields = [
+            f for f, s in field_scores.items()
+            if s < THRESHOLD and f != "line_items"
+        ]
+        needs_review = overall < THRESHOLD or len(low_confidence_fields) >= 3
 
         return {
             "overall": round(overall, 1),
@@ -51,6 +55,12 @@ class ConfidenceScorer:
 
     def _score_field(self, field_name: str, value) -> float:
         """Score a single field 0–100."""
+        # line_items: empty list is normal (OCR rarely reconstructs tables perfectly)
+        if field_name == "line_items":
+            if isinstance(value, list) and len(value) > 0:
+                return 70.0
+            return 40.0  # acceptable — don't penalise missing line items
+
         if value is None or value == [] or value == "":
             return 0.0
 
@@ -73,11 +83,6 @@ class ConfidenceScorer:
                 score += 20.0
             if len(str(value)) >= 6:
                 score += 10.0
-        elif field_name == "line_items":
-            if isinstance(value, list) and len(value) > 0:
-                score += 30.0
-            else:
-                score = 40.0  # Empty list is acceptable
         else:
             if value:
                 score += 30.0

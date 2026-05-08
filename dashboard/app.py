@@ -50,32 +50,36 @@ _SHEETS_SCOPES = [
 
 
 # ── Google Sheets helpers ──────────────────────────────────────────────────────
-@st.cache_resource
-def _get_sheets_client():
-    if not _gcp_info:
-        return None
+def _make_sheets_client(scopes: list):
+    """Create a gspread client from service-account info. Never cached — avoids
+    caching a None on first failure so every call gets a fresh attempt."""
+    import gspread
     try:
-        import gspread
+        # gspread >= 6.x: gspread.authorize() was removed; use service_account_from_dict
+        return gspread.service_account_from_dict(_gcp_info, scopes=scopes)
+    except AttributeError:
+        pass
+    try:
+        # Fallback for older gspread (< 6.0) that still has authorize()
         from google.oauth2.service_account import Credentials
-        creds = Credentials.from_service_account_info(_gcp_info, scopes=_SHEETS_SCOPES)
-        return gspread.authorize(creds)
-    except Exception as exc:
-        st.warning(f"Could not connect to Google Sheets: {exc}")
-        return None
+        creds = Credentials.from_service_account_info(_gcp_info, scopes=scopes)
+        return gspread.authorize(creds)  # type: ignore[attr-defined]
+    except Exception:
+        raise
 
 
 def _get_sheet():
-    client = _get_sheets_client()
-    if not client or not SHEET_ID:
+    if not _gcp_info or not SHEET_ID:
         return None
     try:
+        client = _make_sheets_client(_SHEETS_SCOPES)
         sheet = client.open_by_key(SHEET_ID).sheet1
         existing = sheet.get_all_values()
         if not existing:
             sheet.append_row(SHEET_HEADERS)
         return sheet
     except Exception as exc:
-        st.warning(f"Could not open sheet: {exc}")
+        st.warning(f"Could not open Google Sheet for writing: {exc}")
         return None
 
 
@@ -83,16 +87,18 @@ def _get_sheet():
 def _fetch_sheet_data(sheet_id: str, creds_json: str) -> tuple[list, str]:
     try:
         import gspread
-        from google.oauth2.service_account import Credentials
-        info = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(
-            info,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets.readonly",
-                "https://www.googleapis.com/auth/drive.readonly",
-            ],
-        )
-        client = gspread.authorize(creds)
+        import json as _json
+        info = _json.loads(creds_json)
+        read_scopes = [
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
+        try:
+            client = gspread.service_account_from_dict(info, scopes=read_scopes)
+        except AttributeError:
+            from google.oauth2.service_account import Credentials
+            creds = Credentials.from_service_account_info(info, scopes=read_scopes)
+            client = gspread.authorize(creds)  # type: ignore[attr-defined]
         sheet = client.open_by_key(sheet_id).sheet1
         return sheet.get_all_records(), ""
     except Exception as exc:
@@ -111,6 +117,12 @@ def load_results() -> tuple[pd.DataFrame, str]:
 def write_to_sheet(result: dict) -> bool:
     sheet = _get_sheet()
     if not sheet:
+        if _gcp_info and SHEET_ID:
+            st.warning(
+                "Google Sheets write failed — check the **System Status** tab for errors. "
+                "Verify the sheet is shared with the service-account email and that "
+                "Google Sheets API + Drive API are enabled in your GCP project."
+            )
         return False
     try:
         now = datetime.now(timezone.utc).isoformat()

@@ -71,43 +71,74 @@ class FieldExtractor:
         return None
 
     def extract_invoice_number(self, raw_text: str) -> Optional[str]:
-        patterns = [
-            r"INV[-\s]?\d{4}[-\s]?\d{2,6}",
-            r"Invoice\s*#\s*[\w\-]+",
-            r"Invoice\s*No[.:\s]+[\w\-]+",
-            r"Invoice\s*Number[.:\s]+[\w\-]+",
-            r"Inv\s*#\s*[\w\-]+",
-            r"#\s*(\d{4,})",
+        # Direct patterns — return the full match (no label context needed)
+        direct_patterns = [
+            r"\bINV[-\s/]?\d{4}[-\s/]?\d{2,6}\b",
+            r"\bINV[-\s/]\d+\b",
         ]
-        for pat in patterns:
+        for pat in direct_patterns:
             m = re.search(pat, raw_text, re.IGNORECASE)
             if m:
                 return m.group(0).strip()
+
+        # Label-based: use capturing group to return only the value, not the label.
+        # [:\.\s\n]+ handles "No:", "No.\n", "No:\n", "No: " etc. — including next line.
+        label_patterns = [
+            r"Invoice\s*(?:#|No\.?|Number|ID|Num)[:\.\s\n]+([\w][\w\-/]{2,})",
+            r"Inv\.?\s*(?:#|No\.?|Number)[:\.\s\n]+([\w][\w\-/]{2,})",
+            r"(?:Bill|Order)\s*(?:No\.?|Number|#)[:\.\s\n]+([\w][\w\-/]{2,})",
+        ]
+        for pat in label_patterns:
+            m = re.search(pat, raw_text, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if val and len(val) >= 3:
+                    return val
+
+        # Last resort: bare # followed by digits
+        m = re.search(r"#\s*(\d{4,})", raw_text)
+        if m:
+            return m.group(1).strip()
         return None
 
     def extract_date(self, raw_text: str) -> Optional[str]:
         date_labels = [
-            r"(?:Invoice\s*Date|Date\s*Issued|Issued|Date)[:\s]+",
-            r"Date[:\s]+",
+            r"Invoice\s*Date[:\s]*",
+            r"Date\s*Issued[:\s]*",
+            r"Issued[:\s]*",
+            r"Date[:\s]*",
         ]
         for label in date_labels:
-            m = re.search(label + r"(.{0,40})", raw_text, re.IGNORECASE)
+            # Same line — [^\n] never crosses a newline boundary
+            m = re.search(label + r"([^\n]{0,60})", raw_text, re.IGNORECASE)
             if m:
-                snippet = m.group(1)
-                date = self._parse_date_from_text(snippet)
+                date = self._parse_date_from_text(m.group(1))
+                if date:
+                    return date
+            # Value on the next line (Vision API often splits label from value)
+            m = re.search(label + r"[^\n]{0,10}\n\s*([^\n]{0,60})", raw_text, re.IGNORECASE)
+            if m:
+                date = self._parse_date_from_text(m.group(1))
                 if date:
                     return date
         return self._parse_date_from_text(raw_text)
 
     def extract_due_date(self, raw_text: str) -> Optional[str]:
         labels = [
-            r"(?:Due\s*Date|Payment\s*Due|Due\s*By|Due)[:\s]+",
+            r"(?:Payment\s*)?Due\s*Date[:\s]*",
+            r"Payment\s*Due[:\s]*",
+            r"Due\s*By[:\s]*",
+            r"Pay\s*By[:\s]*",
         ]
         for label in labels:
-            m = re.search(label + r"(.{0,40})", raw_text, re.IGNORECASE)
+            m = re.search(label + r"([^\n]{0,60})", raw_text, re.IGNORECASE)
             if m:
-                snippet = m.group(1)
-                date = self._parse_date_from_text(snippet)
+                date = self._parse_date_from_text(m.group(1))
+                if date:
+                    return date
+            m = re.search(label + r"[^\n]{0,10}\n\s*([^\n]{0,60})", raw_text, re.IGNORECASE)
+            if m:
+                date = self._parse_date_from_text(m.group(1))
                 if date:
                     return date
         return None
@@ -198,15 +229,19 @@ class FieldExtractor:
         Extract a currency amount associated with a label.
         Checks the same line AND the next line (handles OCR multi-line splits).
         """
-        # Try same line first
-        m = re.search(label_pattern + r"(.{0,40})", raw_text, re.IGNORECASE)
+        # Same line — [^\n] never crosses a newline boundary
+        m = re.search(label_pattern + r"([^\n]{0,60})", raw_text, re.IGNORECASE)
         if m:
             amt = self._extract_currency_amount(m.group(1))
             if amt:
                 return amt
 
-        # Try: label on one line, amount on next line (OCR often splits label from value)
-        m2 = re.search(label_pattern + r"[\s\S]{0,5}\n\s*([\$£€S]?\s*\d[\d,\.]*)", raw_text, re.IGNORECASE)
+        # Value on next line — [^\n]{0,10} = any trailing text on label line (before newline)
+        # then \n + optional whitespace + the amount on the next line
+        m2 = re.search(
+            label_pattern + r"[^\n]{0,10}\n\s*([\$£€S]?\s*\d[\d,\.]*)",
+            raw_text, re.IGNORECASE
+        )
         if m2:
             amt = self._extract_currency_amount(m2.group(1))
             if amt:
